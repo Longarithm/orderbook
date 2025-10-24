@@ -1,7 +1,8 @@
 use near_sdk::{
-    assert_one_yocto, env, near_bindgen, AccountId, Balance, BorshStorageKey, PanicOnDefault,
-    Promise, PromiseOrValue, Gas, ONE_YOCTO,
+    assert_one_yocto, env, near_bindgen, AccountId, BorshStorageKey, PanicOnDefault,
+    Promise, PromiseOrValue, Gas, NearToken,
 };
+use near_contract_standards::fungible_token::Balance;
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 use near_sdk::collections::{LookupMap, UnorderedMap, UnorderedSet};
 use near_sdk::serde::{Deserialize, Serialize};
@@ -10,10 +11,8 @@ use near_sdk::json_types::U128;
 
 pub type TokenId = AccountId;
 
-const GAS_FOR_FT_TRANSFER: Gas = Gas(10_000_000_000_000); // 10 Tgas
-const GAS_FOR_FT_TRANSFER_CALL: Gas = Gas(25_000_000_000_000); // 25 Tgas
-
 #[derive(BorshSerialize, BorshStorageKey)]
+#[borsh(crate = "near_sdk::borsh")]
 enum StorageKey {
     Balances,
     Orders,
@@ -22,6 +21,7 @@ enum StorageKey {
 }
 
 #[derive(BorshSerialize, BorshDeserialize)]
+#[borsh(crate = "near_sdk::borsh")]
 struct BalanceKey {
     account_id: AccountId,
     token_id: TokenId,
@@ -34,7 +34,7 @@ pub enum Side {
     Sell,
 }
 
-#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(crate = "near_sdk::serde")]
 pub enum OrderStatus {
     Open,
@@ -72,7 +72,23 @@ const EVENT_VERSION: &str = "1.0.0";
 
 fn emit_event<T: Serialize>(event: &'static str, data: T) {
     let e = OBEvent { standard: EVENT_STANDARD, version: EVENT_VERSION, event, data };
-    env::log_str(&format!("EVENT_JSON:{}", near_sdk::serde_json::to_string(&e).unwrap()));
+    near_sdk::log!("EVENT_JSON:{}", near_sdk::serde_json::to_string(&e).unwrap());
+}
+
+fn parse_side(s: &str) -> Side {
+    match s.to_ascii_lowercase().as_str() {
+        "buy" => Side::Buy,
+        "sell" => Side::Sell,
+        _ => env::panic_str("invalid side"),
+    }
+}
+
+fn side_str(side: &Side) -> &'static str {
+    match side { Side::Buy => "buy", Side::Sell => "sell" }
+}
+
+fn status_str(st: &OrderStatus) -> &'static str {
+    match st { OrderStatus::Open => "open", OrderStatus::Filled => "filled", OrderStatus::Cancelled => "cancelled" }
 }
 
 #[near_bindgen]
@@ -107,7 +123,7 @@ impl Contract {
     #[payable]
     pub fn place_order(
         &mut self,
-        side: Side,
+        side: String,
         amount_base: U128,
         max_spend_quote: Option<U128>,
         price_num: U128,
@@ -118,14 +134,16 @@ impl Contract {
         let amount_base_u128: u128 = amount_base.0;
         assert!(amount_base_u128 > 0, "amount_base must be > 0");
         assert!(price_num.0 > 0 && price_den.0 > 0, "price must be positive");
+        let side_enum = parse_side(&side);
 
-        match side {
+        match side_enum {
             Side::Buy => {
                 let spend = max_spend_quote.expect("max_spend_quote required for Buy").0;
                 assert!(spend > 0, "max_spend_quote must be > 0");
-                let bal = self.internal_get_balance(&caller, &self.quote_token_id);
+                let quote_id = self.quote_token_id.clone();
+                let bal = self.internal_get_balance(&caller, &quote_id);
                 assert!(bal >= spend, "Insufficient quote balance");
-                self.internal_sub_balance(&caller, &self.quote_token_id, spend);
+                self.internal_sub_balance(&caller, &quote_id, spend);
                 let order_id = self.internal_create_order(
                     caller.clone(),
                     Side::Buy,
@@ -150,9 +168,10 @@ impl Contract {
                 order_id
             }
             Side::Sell => {
-                let bal = self.internal_get_balance(&caller, &self.base_token_id);
+                let base_id = self.base_token_id.clone();
+                let bal = self.internal_get_balance(&caller, &base_id);
                 assert!(bal >= amount_base_u128, "Insufficient base balance");
-                self.internal_sub_balance(&caller, &self.base_token_id, amount_base_u128);
+                self.internal_sub_balance(&caller, &base_id, amount_base_u128);
                 let order_id = self.internal_create_order(
                     caller.clone(),
                     Side::Sell,
@@ -190,13 +209,15 @@ impl Contract {
             Side::Buy => {
                 let refund = order.locked_quote_remaining.0;
                 if refund > 0 {
-                    self.internal_add_balance(&caller, &self.quote_token_id, refund);
+                    let quote_id = self.quote_token_id.clone();
+                    self.internal_add_balance(&caller, &quote_id, refund);
                 }
             }
             Side::Sell => {
                 let refund = order.locked_base_remaining.0;
                 if refund > 0 {
-                    self.internal_add_balance(&caller, &self.base_token_id, refund);
+                    let base_id = self.base_token_id.clone();
+                    self.internal_add_balance(&caller, &base_id, refund);
                 }
             }
         }
@@ -239,23 +260,20 @@ impl Contract {
         assert!(maker.side != taker.side, "sides must be opposite");
 
         // Enforce price limits for both maker and taker
-        // quote/base >= maker_min if maker is Sell, <= maker_max if maker is Buy
-        // same for taker
         let (maker_num, maker_den) = (maker.price_num.0, maker.price_den.0);
         let (taker_num, taker_den) = (taker.price_num.0, taker.price_den.0);
 
-        // Avoid overflow using 256-bit? We rely on u128 with checked math assumptions; use saturating mul where necessary.
         match maker.side {
             Side::Sell => {
                 assert!(
-                    quote_paid_u.saturating_mul(maker.price_den.0) >= base_fill_u.saturating_mul(maker.price_num.0),
+                    quote_paid_u.saturating_mul(maker_den) >= base_fill_u.saturating_mul(maker_num),
                     "price below maker's minimum"
                 );
                 assert!(maker.locked_base_remaining.0 >= base_fill_u, "maker base too small");
             }
             Side::Buy => {
                 assert!(
-                    quote_paid_u.saturating_mul(maker.price_den.0) <= base_fill_u.saturating_mul(maker.price_num.0),
+                    quote_paid_u.saturating_mul(maker_den) <= base_fill_u.saturating_mul(maker_num),
                     "price above maker's maximum"
                 );
                 assert!(maker.locked_quote_remaining.0 >= quote_paid_u, "maker quote too small");
@@ -264,14 +282,14 @@ impl Contract {
         match taker.side {
             Side::Sell => {
                 assert!(
-                    quote_paid_u.saturating_mul(taker.price_den.0) >= base_fill_u.saturating_mul(taker.price_num.0),
+                    quote_paid_u.saturating_mul(taker_den) >= base_fill_u.saturating_mul(taker_num),
                     "price below taker's minimum"
                 );
                 assert!(taker.locked_base_remaining.0 >= base_fill_u, "taker base too small");
             }
             Side::Buy => {
                 assert!(
-                    quote_paid_u.saturating_mul(taker.price_den.0) <= base_fill_u.saturating_mul(taker.price_num.0),
+                    quote_paid_u.saturating_mul(taker_den) <= base_fill_u.saturating_mul(taker_num),
                     "price above taker's maximum"
                 );
                 assert!(taker.locked_quote_remaining.0 >= quote_paid_u, "taker quote too small");
@@ -282,6 +300,8 @@ impl Contract {
         // Seller gives base, receives quote. Buyer gives quote, receives base.
         {
             let (seller, buyer, seller_id, buyer_id);
+            let base_id = self.base_token_id.clone();
+            let quote_id = self.quote_token_id.clone();
             if maker.side == Side::Sell {
                 seller = &mut maker;
                 buyer = &mut taker;
@@ -297,8 +317,8 @@ impl Contract {
             seller_id = seller.owner_id.clone();
             buyer_id = buyer.owner_id.clone();
             // Credit balances
-            self.internal_add_balance(&seller_id, &self.quote_token_id, quote_paid_u);
-            self.internal_add_balance(&buyer_id, &self.base_token_id, base_fill_u);
+            self.internal_add_balance(&seller_id, &quote_id, quote_paid_u);
+            self.internal_add_balance(&buyer_id, &base_id, base_fill_u);
         }
 
         // Save orders
@@ -347,8 +367,8 @@ impl Contract {
                     "memo": memo,
                     "msg": msg.clone().unwrap(),
                 })).unwrap(),
-                ONE_YOCTO,
-                GAS_FOR_FT_TRANSFER_CALL,
+                NearToken::from_yoctonear(1),
+                Gas::from_tgas(25),
             )
         } else {
             // ft_transfer
@@ -359,8 +379,8 @@ impl Contract {
                     "amount": U128(amount_u),
                     "memo": memo,
                 })).unwrap(),
-                ONE_YOCTO,
-                GAS_FOR_FT_TRANSFER,
+                NearToken::from_yoctonear(1),
+                Gas::from_tgas(10),
             )
         };
 
@@ -385,18 +405,62 @@ impl Contract {
         U128(self.internal_get_balance(&account_id, &token_id))
     }
 
-    pub fn get_order(&self, order_id: u64) -> Option<Order> { self.orders.get(&order_id) }
+    pub fn get_order(&self, order_id: u64) -> Option<(u64, String, String, U128, U128, U128, U128, U128, U128, String, u64)> {
+        self.orders.get(&order_id).map(|o| (
+            o.id,
+            o.owner_id.to_string(),
+            side_str(&o.side).to_string(),
+            o.price_num,
+            o.price_den,
+            o.amount_base,
+            o.remaining_base,
+            o.locked_quote_remaining,
+            o.locked_base_remaining,
+            status_str(&o.status).to_string(),
+            o.created_at,
+        ))
+    }
 
-    pub fn get_orders(&self, from_index: u64, limit: u64) -> Vec<Order> {
+    pub fn get_orders(&self, from_index: u64, limit: u64) -> Vec<(u64, String, String, U128, U128, U128, U128, U128, U128, String, u64)> {
         let keys: Vec<u64> = self.orders.keys_as_vector().to_vec();
         let start = from_index as usize;
         let end = usize::min(start + (limit as usize), keys.len());
-        keys[start..end].iter().map(|k| self.orders.get(k).unwrap()).collect()
+        keys[start..end].iter().map(|k| {
+            let o = self.orders.get(k).unwrap();
+            (
+                o.id,
+                o.owner_id.to_string(),
+                side_str(&o.side).to_string(),
+                o.price_num,
+                o.price_den,
+                o.amount_base,
+                o.remaining_base,
+                o.locked_quote_remaining,
+                o.locked_base_remaining,
+                status_str(&o.status).to_string(),
+                o.created_at,
+            )
+        }).collect()
     }
 
-    pub fn get_orders_by_owner(&self, owner_id: AccountId) -> Vec<Order> {
+    pub fn get_orders_by_owner(&self, owner_id: AccountId) -> Vec<(u64, String, String, U128, U128, U128, U128, U128, U128, String, u64)> {
         if let Some(set) = self.orders_by_owner.get(&owner_id) {
-            set.iter().map(|id| self.orders.get(&id).unwrap()).collect()
+            set.iter().map(|id| {
+                let o = self.orders.get(&id).unwrap();
+                (
+                    o.id,
+                    o.owner_id.to_string(),
+                    side_str(&o.side).to_string(),
+                    o.price_num,
+                    o.price_den,
+                    o.amount_base,
+                    o.remaining_base,
+                    o.locked_quote_remaining,
+                    o.locked_base_remaining,
+                    status_str(&o.status).to_string(),
+                    o.created_at,
+                )
+            }).collect()
         } else { vec![] }
     }
 }
@@ -429,7 +493,8 @@ impl Contract {
         let mut prefix = vec![];
         prefix.extend(b"ob:");
         prefix.extend(env::sha256(owner_id.as_bytes()));
-        UnorderedSet::new(StorageKey::OrdersByOwnerSet { account_hash: prefix }.try_to_vec().unwrap())
+        let bytes = StorageKey::OrdersByOwnerSet { account_hash: prefix };
+        UnorderedSet::new(near_sdk::borsh::to_vec(&bytes).unwrap())
     }
 
     fn internal_create_order(
@@ -455,7 +520,7 @@ impl Contract {
             locked_quote_remaining: U128(locked_quote),
             locked_base_remaining: U128(locked_base),
             status: OrderStatus::Open,
-            created_at: env::block_timestamp_ms(),
+            created_at: env::block_timestamp() / 1_000_000,
         };
         self.orders.insert(&id, &order);
         let mut set = self.orders_set_for(&owner_id);

@@ -4,7 +4,7 @@ set -euo pipefail
 CONTRACT_ACC=${CONTRACT_ACC:-gloomyswamp.testnet}
 BASE_TOKEN=${BASE_TOKEN:-frog.gloomyswamp.testnet}
 QUOTE_TOKEN=${QUOTE_TOKEN:-toad.gloomyswamp.testnet}
-WASM_PATH=${WASM_PATH:-./contracts/orderbook/target/wasm32-unknown-unknown/release/orderbook.wasm}
+WASM_PATH=${WASM_PATH:-./target/wasm32-unknown-unknown/release/orderbook.wasm}
 
 if [ ! -f "$WASM_PATH" ]; then
   echo "WASM not found at $WASM_PATH. Build first: bash contracts/orderbook/build.sh" >&2
