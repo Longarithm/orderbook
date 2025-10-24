@@ -4,21 +4,15 @@
 - Quote token: `toad.gloomyswamp.testnet`
 - Orderbook contract target: `gloomyswamp.testnet`
 
-## Build
-
-```bash
-bash contracts/orderbook/build.sh
-```
-
-WASM output: `contracts/orderbook/target/wasm32-unknown-unknown/release/orderbook.wasm`
-
-## Deploy
+## Build & Deploy
 
 ```bash
 bash scripts/deploy_orderbook.sh
 # or override
 CONTRACT_ACC=gloomyswamp.testnet BASE_TOKEN=frog.gloomyswamp.testnet QUOTE_TOKEN=toad.gloomyswamp.testnet bash scripts/deploy_orderbook.sh
 ```
+
+This runs `cargo near deploy build-non-reproducible-wasm` and initializes the contract with `new`.
 
 ## Usage (near-cli examples)
 
@@ -36,9 +30,9 @@ Key calls:
 Views:
 - `get_config()` -> `(base_token_id, quote_token_id)`
 - `get_balance(account_id, token_id)` -> `U128`
-- `get_order(order_id)` -> `Order | null`
-- `get_orders(from_index, limit)` -> `Order[]`
-- `get_orders_by_owner(owner_id)` -> `Order[]`
+- `get_order(order_id)` -> tuple summary
+- `get_orders(from_index, limit)` -> tuple summaries
+- `get_orders_by_owner(owner_id)` -> tuple summaries
 
 Price is represented as rational `price_num/price_den` (quote per 1 unit base). Amounts are in smallest token units.
 
